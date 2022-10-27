@@ -1,0 +1,116 @@
+
+<!--Copyright 2020 The HuggingFace Team. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+the License. You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+-->
+
+# Como adicionar uma Pipeline  🤗 Transformers?
+
+Primeiramente, é preciso definir as entradas sem tratamento que a pipeline poderá receber. Essa poderá ser strings, raw bytes, dicionários ou qualquer coisa que seja a entrada desejada. 
+Tente manter o mais próximo do Python puro possível, já que isso facilita torna a compatibilidade mais fácil (até mesmo com outras linguages através do JSON). 
+A entrada específicada será utilizada como `inputs`  na sessão `preprocess` da pipeline.
+
+Após isso, defina os `outputs`. Esses seguem a mesma regra dos `inputs` mencionados antes. Quanto mais simples, melhor. Esses serão os retornos do método `postprocess`.
+
+Comece herdando a classe base `Pipeline` junto dos  4 métodos necessários para implementar: `preprocess`,
+`_forward`, `postprocess` and `_sanitize_parameters`.
+
+
+
+```python
+from transformers import Pipeline
+
+
+class MyPipeline(Pipeline):
+    def _sanitize_parameters(self, **kwargs):
+        preprocess_kwargs = {}
+        if "maybe_arg" in kwargs:
+            preprocess_kwargs["maybe_arg"] = kwargs["maybe_arg"]
+        return preprocess_kwargs, {}, {}
+
+    def preprocess(self, inputs, maybe_arg=2):
+        model_input = Tensor(inputs["input_ids"])
+        return {"model_input": model_input}
+
+    def _forward(self, model_inputs):
+        # model_inputs == {"model_input": model_input}
+        outputs = self.model(**model_inputs)
+        # Maybe {"logits": Tensor(...)}
+        return outputs
+
+    def postprocess(self, model_outputs):
+        best_class = model_outputs["logits"].softmax(-1)
+        return best_class
+```
+A estrutura dividida é intencional e feita para facilitar o suporte à CPU/GPU, ao mesmo tempo que possibilita a execução etapas do pré/pós processamentos em diferentes threads na CPU.
+
+`preprocess` originalmente receberá os inputs definidos, e os pré-processará de maneira adequada para realizar a inferência no modelo, que pode conter mais informações e geralmente é um `Dict`.
+
+`_forward` é um detalhe de implementação e não deve ser usado diretamente. `forward` é o método que deverá ser chamado, já que contém proteções para garantir que tudo rode no mesmo dispositivo. Se algo estiver realmente ligado ao modelo, então pertencerá ao método `_forward`, qualquer coisa extra pertencerá à preprocess/postprocess.
+
+`postprocess` receberá as saídas de  `_forward` e as transformará no saída final definida anteriormente. 
+
+`_sanitize_parameters` existe para permitir o usuário passar quaisquer parâmetros que quiser, sejam esses chamados durante a inicialização `pipeline(...., maybe_arg=4)` ou durante a chamada da classe `pipe = pipeline(...); output = pipe(...., maybe_arg=4)`.
+
+O retorno do método `_sanitize_parameters` são 3 dicionários de kwargs que serão passados diretamente para `preprocess`, `_forward` e `postprocess`. Não preencha nada que o **caller** não chame sem um parâmetro extra. Isso permite manter os parâmetros padrão  na definição do método, o que é sempre mais "natural". 
+
+Um exemplo clássico seria a adição de um parâmetro `top_k` no pós processamento em tasks de classificação.
+
+```python
+>>> pipe = pipeline("my-new-task")
+>>> pipe("This is a test")
+[{"label": "1-star", "score": 0.8}, {"label": "2-star", "score": 0.1}, {"label": "3-star", "score": 0.05}
+{"label": "4-star", "score": 0.025}, {"label": "5-star", "score": 0.025}]
+
+>>> pipe("This is a test", top_k=2)
+[{"label": "1-star", "score": 0.8}, {"label": "2-star", "score": 0.1}]
+```
+
+Para implementá-la, atualizaremos o método `postprocess` com um parâmetro de valor padrão `5`. e editar o método `_sanitize_parameters` para permitir esse novo parâmetro.
+
+
+```python
+def postprocess(self, model_outputs, top_k=5):
+    best_class = model_outputs["logits"].softmax(-1)
+    # Add logic to handle top_k
+    return best_class
+
+
+def _sanitize_parameters(self, **kwargs):
+    preprocess_kwargs = {}
+    if "maybe_arg" in kwargs:
+        preprocess_kwargs["maybe_arg"] = kwargs["maybe_arg"]
+
+    postprocess_kwargs = {}
+    if "top_k" in kwargs:
+        preprocess_kwargs["top_k"] = kwargs["top_k"]
+    return preprocess_kwargs, {}, postprocess_kwargs
+```
+
+Tente manter os inputs/outputs simples e idealmente JSON-serializável, pois isso torna o uso da pipeline extramemente fácil por não requerir que usuários entendam novos tipos de objetos. É relativamente comum suportar diferentes tipos de argumentos para facilitar o uso (arquivos de áudio, nome de arquivos, URLS ou bytes puros)
+
+## Adicionando a pipeline à lista de tasks suportadas
+
+Vá até `src/transformers/pipelines/__init__.py` e preencha `SUPPORTED_TASKS` com sua recém criada pipeline.
+Se possível, essa deve definir um modelo padrão.
+
+## Adicionando testes
+
+Crie um novo arquivo `tests/test_pipelines_MY_PIPELINE.py` tendo como exemplo os outros testes.
+
+O método `run_pipeline_test` é genérico e rodará em modelos pequenos aleatórios de todas possiveis arquiteturas específicadas em `model_mapping` e `tf_model_mapping`.
+
+Essa etapa é importante para testar a compatibilidade no futuro, o que significa que se alguem adicionar um novo modelo para `XXXForQuestionAnswering`, então os testes da pipeline vão tentar rodar os testes nesse novo modelo adicionado. Porque os modelos são aleatóriamente selecionados é impossivel checar valores reais. Por isso existe um helper `ANY` que simplesmente checará se a saída da pipeline coincide com o tipo de pipeline específicado. 
+
+Você também *deve* implementar 2 (idealmente 4) testes.
+
+- `test_small_model_pt` : Defina 1 modelo "small" para essa pipeline (Não importa se os resultados não fizerem sentido) e teste as saídas da pipeline. Os resultados devem ser iguais aos de `test_small_model_tf`.
+- `test_small_model_tf` : Define 1 modelo "small" para essa pipeline (Não importa se os resultados não fizerem sentido) e teste as saídas da pipeline.  Os resultados devem ser iguais aos de `test_small_model_pt`.
+- `test_large_model_pt` (`optional`): Testa a pipeline em uma pipeline real, onde os resultados supostamente devem fazer sentido. Esses testes são lentos e devem ser marcados como. Aqui o objetivo é exibir a pipeline e garantir que não há "drift" em releases futuras.
+- `test_large_model_tf` (`optional`): Testa a pipeline em uma pipeline real, onde os resultados supostamente devem fazer sentido. Esses testes são lentos e devem ser marcados como. Aqui o objetivo é exibir a pipeline e garantir que não há "drift" em releases futuras.
